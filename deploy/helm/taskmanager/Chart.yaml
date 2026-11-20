@@ -1,0 +1,6 @@
+apiVersion: v2
+name: taskmanager
+description: TaskManager microservices (web-gateway, task-service, MongoDB)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

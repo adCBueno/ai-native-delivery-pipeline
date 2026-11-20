@@ -1,0 +1,29 @@
+image:
+  # Images are named <registry>/<service>:<tag>, e.g. registry.gitlab.com/you/project/task-service:abc123
+  registry: registry.gitlab.com/your-namespace/ai-native-delivery-pipeline
+  tag: latest
+  pullPolicy: IfNotPresent
+
+taskService:
+  replicas: 1
+  port: 3001
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 192Mi }
+
+webGateway:
+  replicas: 1
+  port: 3000
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 192Mi }
+
+mongo:
+  image: mongo:7.0
+  # Demo setup: data lives in an emptyDir and is lost when the pod restarts.
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }

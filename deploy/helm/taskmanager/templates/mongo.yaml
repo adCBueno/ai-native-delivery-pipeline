@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-mongo
+  labels:
+    {{- include "taskmanager.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mongo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mongo
+  template:
+    metadata:
+      labels:
+        {{- include "taskmanager.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mongo
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 999 # the mongodb user in the official image
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mongo
+          image: {{ .Values.mongo.image }}
+          ports:
+            - containerPort: 27017
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            periodSeconds: 10
+          securityContext:
+            {{- include "taskmanager.securityContext" . | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data/db }
+            - { name: configdb, mountPath: /data/configdb }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            {{- toYaml .Values.mongo.resources | nindent 12 }}
+      volumes:
+        - { name: data, emptyDir: {} }
+        - { name: configdb, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-mongo
+  labels:
+    {{- include "taskmanager.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mongo
+  ports:
+    - port: 27017

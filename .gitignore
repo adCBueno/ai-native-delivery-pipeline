@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+junit.xml
+.npm/
+.trivycache/
+__pycache__/
+.pytest_cache/
+*-junit.xml
+ai-failure-report.md
+rendered.yaml
+sbom-*.json
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+infra/terraform/*-config

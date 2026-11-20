@@ -1,0 +1,250 @@
+# AI-native delivery pipeline for the TaskManager microservices.
+#
+#   lint -> test -> build -> security -> deploy -> report
+#
+# Every merge request gets: lint + type checks, unit tests with coverage
+# shown in the MR, container images, security scans (secrets, dependencies,
+# IaC misconfigurations, images + SBOM), a real deploy to a throwaway
+# Kubernetes cluster with a smoke test, and, if anything fails, an AI
+# summary of the failure posted as an MR comment.
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never # avoid duplicate branch + MR pipelines
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages: [lint, test, build, security, deploy, report]
+
+# GitLab's own secret scanner (available on every GitLab tier).
+include:
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+variables:
+  NODE_IMAGE: node:22-alpine
+  PYTHON_IMAGE: python:3.13-slim
+  DOCKER_IMAGE: docker:27
+  DOCKER_DIND_IMAGE: docker:27-dind
+  # Pin these to a verified version (ideally by digest) before relying on them.
+  TRIVY_IMAGE: aquasec/trivy:latest
+  HELM_IMAGE: alpine/helm:3.16.4
+  TERRAFORM_IMAGE: hashicorp/terraform:1.10
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  # Docker-in-docker over TLS
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "/certs/client"
+
+# ---------------------------------------------------------------- templates
+
+.per-service:
+  parallel:
+    matrix:
+      - SERVICE: [task-service, web-gateway]
+
+.node:
+  extends: .per-service
+  image: $NODE_IMAGE
+  before_script:
+    - cd services/$SERVICE
+    - npm ci --prefer-offline --no-audit --no-fund
+  cache:
+    key:
+      files: [services/$SERVICE/package-lock.json]
+      prefix: npm-$SERVICE
+    paths: [.npm/]
+    policy: pull-push
+  variables:
+    npm_config_cache: $CI_PROJECT_DIR/.npm
+
+.dind:
+  image: $DOCKER_IMAGE
+  services:
+    - name: $DOCKER_DIND_IMAGE
+      alias: docker
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+# --------------------------------------------------------------------- lint
+
+lint:
+  extends: .node
+  stage: lint
+  script:
+    - npm run lint
+    - npm run typecheck
+
+iac:validate:
+  stage: lint
+  image:
+    name: $TERRAFORM_IMAGE
+    entrypoint: [""]
+  script:
+    - cd infra/terraform
+    - terraform fmt -check -recursive
+    - terraform init -backend=false -input=false
+    - terraform validate
+
+helm:lint:
+  stage: lint
+  image:
+    name: $HELM_IMAGE
+    entrypoint: [""]
+  script:
+    - helm lint deploy/helm/taskmanager --strict
+    - helm template ci deploy/helm/taskmanager > rendered.yaml
+  artifacts:
+    paths: [rendered.yaml]
+    expire_in: 1 week
+
+# --------------------------------------------------------------------- test
+
+test:
+  extends: .node
+  stage: test
+  needs: [] # start right away, don't wait for lint
+  script:
+    - npm test
+  coverage: '/All files\s*\|\s*([\d.]+)/'
+  artifacts:
+    when: always
+    reports:
+      junit: services/$SERVICE/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: services/$SERVICE/coverage/cobertura-coverage.xml
+
+tools:test:
+  stage: test
+  image: $PYTHON_IMAGE
+  needs: []
+  script:
+    - pip install --quiet -r tools/requirements.txt pytest
+    - pytest tools --junitxml=tools-junit.xml
+  artifacts:
+    when: always
+    reports:
+      junit: tools-junit.xml
+
+secret_detection: # job comes from the included template
+  stage: test
+  needs: []
+
+# -------------------------------------------------------------------- build
+
+build:
+  extends: [.dind, .per-service]
+  stage: build
+  needs: [lint, test]
+  script:
+    - IMAGE="$CI_REGISTRY_IMAGE/$SERVICE"
+    - docker buildx create --use --driver docker-container
+    # Registry layer cache: unchanged layers are reused between pipelines.
+    - >
+      docker buildx build services/$SERVICE
+      --cache-from type=registry,ref=$IMAGE:buildcache
+      --cache-to type=registry,ref=$IMAGE:buildcache,mode=max
+      --label org.opencontainers.image.revision=$CI_COMMIT_SHA
+      --label org.opencontainers.image.source=$CI_PROJECT_URL
+      --tag $IMAGE:$IMAGE_TAG
+      --push
+
+# ----------------------------------------------------------------- security
+
+# Dependencies (npm + pip) and misconfigurations in Dockerfiles, Helm and Terraform.
+trivy:repo:
+  stage: security
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: []
+  variables:
+    TRIVY_CACHE_DIR: .trivycache
+  cache:
+    key: trivy
+    paths: [.trivycache/]
+  script:
+    - trivy fs . --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+
+trivy:image:
+  extends: .per-service
+  stage: security
+  image:
+    name: $TRIVY_IMAGE
+    entrypoint: [""]
+  needs: [build]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+    TRIVY_CACHE_DIR: .trivycache
+  cache:
+    key: trivy
+    paths: [.trivycache/]
+  script:
+    - IMAGE="$CI_REGISTRY_IMAGE/$SERVICE:$IMAGE_TAG"
+    # SBOM first, so we keep it even if the scan fails.
+    - trivy image --format cyclonedx --output sbom-$SERVICE.cdx.json "$IMAGE"
+    - trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE"
+  artifacts:
+    when: always
+    paths: [sbom-$SERVICE.cdx.json]
+    reports:
+      cyclonedx: sbom-$SERVICE.cdx.json
+
+# ------------------------------------------------------------------- deploy
+
+# Deploys the freshly built images to a throwaway kind cluster inside
+# docker-in-docker and runs a smoke test through the gateway.
+deploy:smoke:
+  extends: .dind
+  stage: deploy
+  needs: [build, helm:lint]
+  variables:
+    KIND_VERSION: v0.26.0
+    KUBECTL_VERSION: v1.32.0
+  script:
+    - apk add --no-cache curl bash helm
+    - curl -sSLo /usr/local/bin/kind "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64"
+    - curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+    - chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+    - kind create cluster --name ci --config deploy/kind/ci-cluster.yaml --wait 120s
+    # The cluster runs inside the "docker" service, so point kubectl there.
+    - |
+      sed -i -E 's#server: https://[^:]+:#server: https://docker:#' "$HOME/.kube/config"
+    - |
+      for svc in task-service web-gateway; do
+        docker pull "$CI_REGISTRY_IMAGE/$svc:$IMAGE_TAG"
+        kind load docker-image --name ci "$CI_REGISTRY_IMAGE/$svc:$IMAGE_TAG"
+      done
+    - >
+      helm upgrade --install taskmanager deploy/helm/taskmanager
+      --set image.registry=$CI_REGISTRY_IMAGE
+      --set image.tag=$IMAGE_TAG
+      --set image.pullPolicy=Never
+      --wait --timeout 3m
+    - bash deploy/smoke-test.sh
+  after_script:
+    - kubectl get pods -o wide || true
+    - kubectl logs -l app.kubernetes.io/instance=taskmanager --all-containers --tail=50 || true
+
+# ------------------------------------------------------------------- report
+
+# Runs only when an earlier job failed. Reads the failed jobs' logs, removes
+# secrets, asks an LLM for the likely root cause and posts it on the MR.
+ai:explain-failure:
+  stage: report
+  image: $PYTHON_IMAGE
+  allow_failure: true
+  rules:
+    - if: $ANTHROPIC_API_KEY && $GITLAB_API_TOKEN
+      when: on_failure
+  script:
+    - pip install --quiet -r tools/requirements.txt
+    - python tools/explain_failure.py
+  artifacts:
+    when: always
+    paths: [ai-failure-report.md]
+    expire_in: 2 weeks

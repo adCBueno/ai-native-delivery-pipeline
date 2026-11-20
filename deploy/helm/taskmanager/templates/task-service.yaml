@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-task-service
+  labels:
+    {{- include "taskmanager.labels" . | nindent 4 }}
+    app.kubernetes.io/name: task-service
+spec:
+  replicas: {{ .Values.taskService.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: task-service
+  template:
+    metadata:
+      labels:
+        {{- include "taskmanager.labels" . | nindent 8 }}
+        app.kubernetes.io/name: task-service
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: task-service
+          image: "{{ .Values.image.registry }}/task-service:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.taskService.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.taskService.port | quote }}
+            - name: MONGO_URL
+              value: "mongodb://{{ .Release.Name }}-mongo:27017"
+          readinessProbe:
+            httpGet: { path: /health, port: {{ .Values.taskService.port }} }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: {{ .Values.taskService.port }} }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            {{- include "taskmanager.securityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.taskService.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-task-service
+  labels:
+    {{- include "taskmanager.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: task-service
+  ports:
+    - port: {{ .Values.taskService.port }}
+      targetPort: {{ .Values.taskService.port }}

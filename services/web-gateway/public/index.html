@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TaskManager</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+    form { display: flex; gap: .5rem; }
+    input { flex: 1; padding: .5rem; }
+    li { display: flex; gap: .5rem; align-items: center; padding: .25rem 0; }
+    .done span { text-decoration: line-through; color: #888; }
+    button.del { margin-left: auto; }
+  </style>
+</head>
+<body>
+  <h1>TaskManager</h1>
+  <form id="new">
+    <input id="title" placeholder="New task" maxlength="200" required />
+    <button>Add</button>
+  </form>
+  <ul id="list"></ul>
+  <script>
+    const list = document.getElementById("list");
+    async function load() {
+      const tasks = await (await fetch("/api/tasks")).json();
+      list.replaceChildren(...tasks.map((t) => {
+        const li = document.createElement("li");
+        li.className = t.done ? "done" : "";
+        const box = Object.assign(document.createElement("input"), { type: "checkbox", checked: t.done });
+        box.onchange = () => send("PATCH", t.id, { done: box.checked });
+        const label = Object.assign(document.createElement("span"), { textContent: t.title });
+        const del = Object.assign(document.createElement("button"), { textContent: "Delete", className: "del" });
+        del.onclick = () => send("DELETE", t.id);
+        li.append(box, label, del);
+        return li;
+      }));
+    }
+    async function send(method, id, body) {
+      await fetch(`/api/tasks/${id}`, { method, headers: { "content-type": "application/json" }, body: body && JSON.stringify(body) });
+      load();
+    }
+    document.getElementById("new").onsubmit = async (e) => {
+      e.preventDefault();
+      const input = document.getElementById("title");
+      await fetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: input.value }) });
+      input.value = "";
+      load();
+    };
+    load();
+  </script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web-gateway
+  labels:
+    {{- include "taskmanager.labels" . | nindent 4 }}
+    app.kubernetes.io/name: web-gateway
+spec:
+  replicas: {{ .Values.webGateway.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: web-gateway
+  template:
+    metadata:
+      labels:
+        {{- include "taskmanager.labels" . | nindent 8 }}
+        app.kubernetes.io/name: web-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web-gateway
+          image: "{{ .Values.image.registry }}/web-gateway:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.webGateway.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.webGateway.port | quote }}
+            - name: TASK_SERVICE_URL
+              value: "http://{{ .Release.Name }}-task-service:{{ .Values.taskService.port }}"
+          readinessProbe:
+            httpGet: { path: /health, port: {{ .Values.webGateway.port }} }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: {{ .Values.webGateway.port }} }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            {{- include "taskmanager.securityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.webGateway.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-web-gateway
+  labels:
+    {{- include "taskmanager.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.webGateway.service.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: web-gateway
+  ports:
+    - port: {{ .Values.webGateway.service.port }}
+      targetPort: {{ .Values.webGateway.port }}

@@ -1,0 +1,5 @@
+TaskManager is deployed.
+
+Open the UI:
+  kubectl port-forward svc/{{ .Release.Name }}-web-gateway 8080:{{ .Values.webGateway.service.port }}
+  then visit http://localhost:8080
